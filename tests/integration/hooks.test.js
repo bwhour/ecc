@@ -90,6 +90,14 @@ function runHookWithInput(scriptPath, input = {}, env = {}, timeoutMs = 10000) {
   });
 }
 
+function getSessionStartPayload(stdout) {
+  assert.ok(stdout.trim(), 'Expected SessionStart hook to emit stdout payload');
+  const payload = JSON.parse(stdout);
+  assert.strictEqual(payload.hookSpecificOutput?.hookEventName, 'SessionStart');
+  assert.strictEqual(typeof payload.hookSpecificOutput?.additionalContext, 'string');
+  return payload;
+}
+
 /**
  * Run a hook command string exactly as declared in hooks.json.
  * Supports wrapped node script commands and shell wrappers.
@@ -249,11 +257,14 @@ async function runTests() {
   // ==========================================
   console.log('\nHook Output Format:');
 
-  if (await asyncTest('hooks output messages to stderr (not stdout)', async () => {
+  if (await asyncTest('session-start logs diagnostics to stderr and emits structured stdout when context exists', async () => {
     const result = await runHookWithInput(path.join(scriptsDir, 'session-start.js'), {});
     // Session-start should write info to stderr
     assert.ok(result.stderr.length > 0, 'Should have stderr output');
     assert.ok(result.stderr.includes('[SessionStart]'), 'Should have [SessionStart] prefix');
+    const payload = getSessionStartPayload(result.stdout);
+    assert.ok(payload.hookSpecificOutput, 'Should include hookSpecificOutput');
+    assert.strictEqual(payload.hookSpecificOutput.hookEventName, 'SessionStart');
   })) passed++; else failed++;
 
   if (await asyncTest('PreCompact hook logs to stderr', async () => {
@@ -290,6 +301,101 @@ async function runTests() {
   if (await asyncTest('non-blocking hooks exit with code 0', async () => {
     const result = await runHookWithInput(path.join(scriptsDir, 'session-end.js'), {});
     assert.strictEqual(result.code, 0, 'Non-blocking hook should exit 0');
+  })) passed++; else failed++;
+
+  if (await asyncTest('session-start registers an observer lease for the active session', async () => {
+    const testDir = createTestDir();
+    const projectDir = path.join(testDir, 'project');
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    try {
+      const sessionId = `session-${Date.now()}`;
+      const result = await runHookWithInput(
+        path.join(scriptsDir, 'session-start.js'),
+        {},
+        {
+          HOME: testDir,
+          CLAUDE_PROJECT_DIR: projectDir,
+          CLAUDE_SESSION_ID: sessionId
+        }
+      );
+
+      assert.strictEqual(result.code, 0, 'SessionStart should exit 0');
+      const homunculusDir = path.join(testDir, '.claude', 'homunculus');
+      const projectsDir = path.join(homunculusDir, 'projects');
+      const projectEntries = fs.existsSync(projectsDir) ? fs.readdirSync(projectsDir) : [];
+      assert.ok(projectEntries.length > 0, 'SessionStart should create a homunculus project directory');
+      const leaseDir = path.join(projectsDir, projectEntries[0], '.observer-sessions');
+      const leaseFiles = fs.existsSync(leaseDir) ? fs.readdirSync(leaseDir).filter(name => name.endsWith('.json')) : [];
+      assert.ok(leaseFiles.length === 1, `Expected one observer lease file, found ${leaseFiles.length}`);
+    } finally {
+      cleanupTestDir(testDir);
+    }
+  })) passed++; else failed++;
+
+  if (await asyncTest('session-end-marker removes the last lease and stops the observer process', async () => {
+    const testDir = createTestDir();
+    const projectDir = path.join(testDir, 'project');
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    const sessionId = `session-${Date.now()}`;
+    const sleeper = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"], {
+      stdio: 'ignore'
+    });
+
+    try {
+      await runHookWithInput(
+        path.join(scriptsDir, 'session-start.js'),
+        {},
+        {
+          HOME: testDir,
+          CLAUDE_PROJECT_DIR: projectDir,
+          CLAUDE_SESSION_ID: sessionId
+        }
+      );
+
+      const homunculusDir = path.join(testDir, '.claude', 'homunculus');
+      const projectsDir = path.join(homunculusDir, 'projects');
+      const projectEntries = fs.existsSync(projectsDir) ? fs.readdirSync(projectsDir) : [];
+      assert.ok(projectEntries.length > 0, 'Expected SessionStart to create a homunculus project directory');
+      const projectStorageDir = path.join(projectsDir, projectEntries[0]);
+      const pidFile = path.join(projectStorageDir, '.observer.pid');
+      fs.writeFileSync(pidFile, `${sleeper.pid}\n`);
+
+      const markerInput = { hook_event_name: 'SessionEnd' };
+      const result = await runHookWithInput(
+        path.join(scriptsDir, 'session-end-marker.js'),
+        markerInput,
+        {
+          HOME: testDir,
+          CLAUDE_PROJECT_DIR: projectDir,
+          CLAUDE_SESSION_ID: sessionId
+        }
+      );
+
+      assert.strictEqual(result.code, 0, 'SessionEnd marker should exit 0');
+      assert.strictEqual(result.stdout, JSON.stringify(markerInput), 'SessionEnd marker should pass stdin through unchanged');
+
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const exited = sleeper.exitCode !== null || sleeper.signalCode !== null;
+      let processAlive = !exited;
+      if (processAlive) {
+        try {
+          process.kill(sleeper.pid, 0);
+        } catch {
+          processAlive = false;
+        }
+      }
+      assert.strictEqual(processAlive, false, 'SessionEnd marker should stop the observer process when the last lease ends');
+
+      const leaseDir = path.join(projectStorageDir, '.observer-sessions');
+      const leaseFiles = fs.existsSync(leaseDir) ? fs.readdirSync(leaseDir).filter(name => name.endsWith('.json')) : [];
+      assert.strictEqual(leaseFiles.length, 0, 'SessionEnd marker should remove the finished session lease');
+      assert.strictEqual(fs.existsSync(pidFile), false, 'SessionEnd marker should remove the observer pid file after stopping it');
+    } finally {
+      sleeper.kill();
+      cleanupTestDir(testDir);
+    }
   })) passed++; else failed++;
 
   if (await asyncTest('dev server hook transforms yarn dev to tmux session', async () => {
